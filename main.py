@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 import httpx
 from pathlib import Path
 from typing import Optional
+import re
+from pathlib import Path
+from resume_scoring import extract_text_from_pdf, extract_text_from_docx
 
 # Load API key
 load_dotenv()
@@ -81,41 +84,72 @@ async def handle_upload(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(500, detail=f"Error saving file: {str(e)}")
 
-    # Score resume
+    # Extract text from resume
     try:
-        score, feedback = score_resume(file_path)
+        if file_ext == '.pdf':
+            text = extract_text_from_pdf(file_path)
+        else:
+            text = extract_text_from_docx(file_path)
     except Exception as e:
-        raise HTTPException(500, detail=f"Error analyzing resume: {str(e)}")
+        raise HTTPException(500, detail=f"Error reading file: {str(e)}")
 
-    # Get AI feedback if API key is available
-    ai_feedback = None
-    if OPENROUTER_API_KEY:
-        ai_prompt = (
-            f"Resume scored {score}/100 on ATS compatibility. "
-            f"Here are the key sections found: {feedback[:3]}. "
-            "Provide 3-5 concise bullet points for improvement."
-        )
-        try:
-            ai_feedback = await query_deepseek(ai_prompt)
-            if ai_feedback:
-                feedback.append("\n🧠 AI Suggestions:\n" + ai_feedback)
-        except Exception as e:
-            feedback.append("\n⚠ Could not fetch AI suggestions")
+    if not text.strip():
+        raise HTTPException(400, detail="Document appears to be empty")
 
-    # Generate PDF report
-    report_id = f"{file_id}.pdf"
-    pdf_path = os.path.join(REPORT_DIR, report_id)
+    # Prepare DeepSeek prompt
+    prompt = f"""
+    Analyze this resume for ATS (Applicant Tracking System) compatibility and provide:
+    1. A score from 0-100 based on ATS optimization
+    2. Detailed feedback in bullet points with emojis (✓ for good, ⚠ for issues)
+    3. Specific suggestions for improvement
+
+    Resume Content:
+    {text[:3000]}... [truncated for length]
+
+    Evaluation Criteria:
+    - Section completeness (Contact, Summary, Experience, Education, Skills)
+    - Keyword optimization and relevance
+    - Formatting and readability (bullet points, clear headings)
+    - ATS-specific best practices (no tables, proper headers)
+    - Quantifiable achievements
+    - Appropriate length (1-2 pages)
+
+    Return the response with the score first as "Score: XX/100" followed by bullet points.
+    Include both positive aspects (✓) and areas for improvement (⚠).
+    """
+
+    # Get AI analysis
     try:
+        ai_response = await query_deepseek(prompt)
+        
+        if not ai_response:
+            raise HTTPException(500, detail="Failed to get AI analysis")
+
+        # Parse the response
+        score_match = re.search(r'Score:\s*(\d+)/100', ai_response)
+        score = int(score_match.group(1)) if score_match else 50
+
+        # Process feedback
+        feedback = []
+        for line in ai_response.split('\n'):
+            line = line.strip()
+            if line.startswith(('✓', '⚠', '-', '•', '*')) or (line and not line.startswith('Score:')):
+                feedback.append(line)
+
+        # Generate PDF report
+        report_id = f"{file_id}.pdf"
+        pdf_path = os.path.join(REPORT_DIR, report_id)
         generate_pdf(score, feedback, pdf_path)
-    except Exception as e:
-        raise HTTPException(500, detail=f"Error generating report: {str(e)}")
 
-    return templates.TemplateResponse("results.html", {
-        "request": request,
-        "score": score,
-        "feedback": feedback,
-        "pdf_name": report_id
-    })
+        return templates.TemplateResponse("results.html", {
+            "request": request,
+            "score": score,
+            "feedback": feedback,
+            "pdf_name": report_id
+        })
+
+    except Exception as e:
+        raise HTTPException(500, detail=f"Error processing resume: {str(e)}")
 
 @app.get("/download/{pdf_name}")
 async def download_report(pdf_name: str):
